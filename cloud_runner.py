@@ -114,9 +114,9 @@ def parse_ifd_and_tiles(conn, path):
                 comp_type = val_off
             elif tag == 317:
                 predictor = val_off
-            elif tag == 324:
+            elif tag in (324, 273):
                 off_tag, ntiles, off_type = val_off, count, ttype
-            elif tag == 325:
+            elif tag in (325, 279):
                 cnt_tag, cnt_type = val_off, ttype
 
         off_elem_sz = 8 if off_type == 16 else 4
@@ -160,9 +160,9 @@ def parse_ifd_and_tiles(conn, path):
                 comp_type = val_off
             elif tag == 317:
                 predictor = val_off
-            elif tag == 324:
+            elif tag in (324, 273):
                 off_tag, ntiles, off_type = val_off, count, ttype
-            elif tag == 325:
+            elif tag in (325, 279):
                 cnt_tag, cnt_type = val_off, ttype
 
         off_elem_sz = 8 if off_type == 16 else 4
@@ -223,6 +223,22 @@ def fetch_and_crop_day(item):
                 canvas_clt[0:512, :] = decompress_tile(b_top, comp_type, predictor)
                 canvas_clt[512:1024, :] = decompress_tile(b_bot, comp_type, predictor)
                 return (dt_str, canvas_clt[np.ix_(CLT_REL_ROWS, CLT_REL_COLS)].copy(), len(b_top) + len(b_bot))
+
+            if ntiles == 20880:
+                # Stripped TIFF (RowsPerStrip=1, 20880 scanlines of width 43200)
+                s_str = tile_offsets[ROW_START]
+                e_str = tile_offsets[ROW_END - 1] + tile_counts[ROW_END - 1] - 1
+                b_str, _ = fetch_range(conn, path, s_str, e_str)
+                cropped = np.empty((ROW_END - ROW_START, COL_END - COL_START), dtype=np.uint16)
+                for r_i, s_idx in enumerate(range(ROW_START, ROW_END)):
+                    rel_s = tile_offsets[s_idx] - s_str
+                    comp_slice = b_str[rel_s:rel_s + tile_counts[s_idx]]
+                    raw = zlib.decompress(comp_slice) if comp_type in (8, 32946) else (imagecodecs.lzw_decode(comp_slice) if comp_type == 5 else comp_slice)
+                    row_arr = np.frombuffer(raw, dtype="<u2")
+                    if predictor == 2:
+                        row_arr = np.cumsum(row_arr, dtype=np.uint16)
+                    cropped[r_i, :] = row_arr[COL_START:COL_END]
+                return (dt_str, cropped, len(b_str))
 
             # Check if row 10 tiles (898, 899, 900) are contiguous and reasonably sized
             s10 = min(tile_offsets[898], tile_offsets[899], tile_offsets[900])
