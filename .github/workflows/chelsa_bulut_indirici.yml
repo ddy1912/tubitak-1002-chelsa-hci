@@ -1,0 +1,44 @@
+name: CHELSA-daily v2.1 Otomatik Bulut İndirici (1979-2025)
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_year:
+        description: 'Başlangıç yılı'
+        required: true
+        default: '1979'
+      end_year:
+        description: 'Bitiş yılı'
+        required: true
+        default: '2025'
+  push:
+    branches: [ main, master ]
+
+permissions:
+  contents: write
+
+jobs:
+  chelsa_parallel_download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        variable: ['tas', 'tasmax', 'hurs', 'clt', 'prec', 'sfcWind', 'rsds', 'pr']
+    steps:
+      - name: Depoyu İndir
+        uses: actions/checkout@v4
+
+      - name: Python 3.11 Kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: NumPy Kur
+        run: pip install numpy
+
+      - name: CHELSA COG Karolarını İndir ve Kaydet (${{ matrix.variable }})
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python cloud_runner.py ${{ matrix.variable }} ${{ github.event.inputs.start_year || '1979' }} ${{ github.event.inputs.end_year || '2025' }}
