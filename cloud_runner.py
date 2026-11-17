@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-GitHub Actions Bulut İndirici (cloud_runner.py)
+GitHub Actions Bulut İndirici (cloud_runner.py) - v2 (Classic TIFF + BigTIFF + Deflate + LZW Destekli)
 Bilgisayar kapalıyken GitHub sunucularında çalışır:
-1) CHELSA-daily v2.1 (1979-2025) COG karolarını HTTP-Range ile çeker ve Türkiye Ege/Akdeniz (636x1380) alanına kırpar.
+1) CHELSA-daily v2.1 (1979-2025) COG karolarını HTTP-Range ile çeker (hem Classic TIFF 'II*' hem BigTIFF 'II+',
+   hem Deflate [comp=8] hem LZW [comp=5] sıkıştırmalarını ve dosya sonu IFD'lerini destekler).
 2) Her yılı sıkıştırılmış .npz kübü (CHELSA_{var}_{year}_EgeAkdeniz_1km.npz) olarak kaydeder.
-3) Otomatik olarak hem GitHub Release ('chelsa-v2.1-data') altına yükler (hiçbir dış şifre/token gerektirmez),
-   hem de eğer GDRIVE_RCLONE_TOKEN tanımlıysa doğrudan Google Drive'a aktarır.
+3) Otomatik olarak GitHub Release ('chelsa-v2.1-data') altına yükler (mevcut yılları atlar).
 """
 import os
 import re
 import sys
+import json
 import time
 import zlib
 import struct
@@ -20,6 +21,12 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
+
+try:
+    import imagecodecs
+    HAS_IMAGECODECS = True
+except ImportError:
+    HAS_IMAGECODECS = False
 
 COL_START, COL_END = 24660, 26040  # 1380 sütun (25.50°D - 37.00°D)
 ROW_START, ROW_END = 5183, 5819    # 636 satır  (35.51°K - 40.81°K)
@@ -37,7 +44,7 @@ tls = threading.local()
 
 def get_conn():
     if not hasattr(tls, "conn") or tls.conn is None:
-        tls.conn = http.client.HTTPSConnection("os.unil.cloud.switch.ch", timeout=25)
+        tls.conn = http.client.HTTPSConnection("os.unil.cloud.switch.ch", timeout=30)
     return tls.conn
 
 
@@ -47,14 +54,143 @@ def reset_conn():
             tls.conn.close()
         except Exception:
             pass
-    tls.conn = http.client.HTTPSConnection("os.unil.cloud.switch.ch", timeout=25)
+    tls.conn = http.client.HTTPSConnection("os.unil.cloud.switch.ch", timeout=30)
     return tls.conn
+
+
+def fetch_range(conn, path, start_b, end_b):
+    expected = end_b - start_b + 1
+    conn.request("GET", path, headers={"Range": f"bytes={start_b}-{end_b}", "Connection": "keep-alive"})
+    resp = conn.getresponse()
+    data = resp.read()
+    if resp.status not in (200, 206) or len(data) < expected:
+        raise RuntimeError(f"HTTP {resp.status}: got {len(data)}/{expected} bytes")
+    return data, resp.getheader("Content-Range", "")
+
+
+def decompress_tile(comp_bytes, comp_type, predictor):
+    if comp_type == 8 or comp_type == 32946:
+        raw = zlib.decompress(comp_bytes)
+    elif comp_type == 5:
+        if HAS_IMAGECODECS:
+            raw = imagecodecs.lzw_decode(comp_bytes)
+        else:
+            raise RuntimeError("LZW tile requires imagecodecs")
+    elif comp_type == 1:
+        raw = comp_bytes
+    else:
+        raise RuntimeError(f"Unsupported TIFF compression: {comp_type}")
+
+    arr = np.frombuffer(raw, dtype="<u2").reshape(512, 512)
+    if predictor == 2:
+        arr = np.cumsum(arr, axis=1, dtype=np.uint16)
+    return arr
+
+
+def parse_ifd_and_tiles(conn, path):
+    buf0, crange = fetch_range(conn, path, 0, 32767)
+    total_len = int(crange.split("/")[-1]) if "/" in crange else None
+    magic = buf0[:4]
+
+    if magic == b"II*\x00":
+        # Classic 32-bit TIFF
+        ifd_off = struct.unpack("<I", buf0[4:8])[0]
+        if ifd_off + 20000 <= len(buf0):
+            ifd_buf = buf0
+            base_off = 0
+        else:
+            end_b = min(total_len - 1, ifd_off + 65535) if total_len else ifd_off + 65535
+            ifd_buf, _ = fetch_range(conn, path, ifd_off, end_b)
+            base_off = ifd_off
+
+        rel_ifd = ifd_off - base_off
+        num_entries = struct.unpack("<H", ifd_buf[rel_ifd:rel_ifd + 2])[0]
+        comp_type, predictor = 8, 2
+        off_tag, cnt_tag, ntiles, off_type, cnt_type = 0, 0, 3485, 4, 4
+        for i in range(num_entries):
+            pos = rel_ifd + 2 + i * 12
+            tag, ttype, count, val_off = struct.unpack("<HHII", ifd_buf[pos:pos + 12])
+            if tag == 259:
+                comp_type = val_off
+            elif tag == 317:
+                predictor = val_off
+            elif tag == 324:
+                off_tag, ntiles, off_type = val_off, count, ttype
+            elif tag == 325:
+                cnt_tag, cnt_type = val_off, ttype
+
+        off_elem_sz = 8 if off_type == 16 else 4
+        cnt_elem_sz = 8 if cnt_type == 16 else 4
+        off_fmt = f"<{ntiles}{'Q' if off_elem_sz == 8 else 'I'}"
+        cnt_fmt = f"<{ntiles}{'Q' if cnt_elem_sz == 8 else 'I'}"
+
+        if off_tag >= base_off and off_tag + ntiles * off_elem_sz <= base_off + len(ifd_buf):
+            b_off = ifd_buf[off_tag - base_off:off_tag - base_off + ntiles * off_elem_sz]
+        else:
+            b_off, _ = fetch_range(conn, path, off_tag, off_tag + ntiles * off_elem_sz - 1)
+
+        if cnt_tag >= base_off and cnt_tag + ntiles * cnt_elem_sz <= base_off + len(ifd_buf):
+            b_cnt = ifd_buf[cnt_tag - base_off:cnt_tag - base_off + ntiles * cnt_elem_sz]
+        else:
+            b_cnt, _ = fetch_range(conn, path, cnt_tag, cnt_tag + ntiles * cnt_elem_sz - 1)
+
+        tile_offsets = struct.unpack(off_fmt, b_off)
+        tile_counts = struct.unpack(cnt_fmt, b_cnt)
+        return ntiles, comp_type, predictor, tile_offsets, tile_counts
+
+    elif magic == b"II+\x00":
+        # 64-bit BigTIFF
+        _, _, ifd_off = struct.unpack("<HHQ", buf0[4:16])
+        if ifd_off + 36000 <= len(buf0):
+            ifd_buf = buf0
+            base_off = 0
+        else:
+            end_b = min(total_len - 1, ifd_off + 65535) if total_len else ifd_off + 65535
+            ifd_buf, _ = fetch_range(conn, path, ifd_off, end_b)
+            base_off = ifd_off
+
+        rel_ifd = ifd_off - base_off
+        num_entries = struct.unpack("<Q", ifd_buf[rel_ifd:rel_ifd + 8])[0]
+        comp_type, predictor = 8, 2
+        off_tag, cnt_tag, ntiles, off_type, cnt_type = 0, 0, 3485, 16, 4
+        for i in range(num_entries):
+            pos = rel_ifd + 8 + i * 20
+            tag, ttype, count, val_off = struct.unpack("<HHQQ", ifd_buf[pos:pos + 20])
+            if tag == 259:
+                comp_type = val_off
+            elif tag == 317:
+                predictor = val_off
+            elif tag == 324:
+                off_tag, ntiles, off_type = val_off, count, ttype
+            elif tag == 325:
+                cnt_tag, cnt_type = val_off, ttype
+
+        off_elem_sz = 8 if off_type == 16 else 4
+        cnt_elem_sz = 8 if cnt_type == 16 else 4
+        off_fmt = f"<{ntiles}{'Q' if off_elem_sz == 8 else 'I'}"
+        cnt_fmt = f"<{ntiles}{'Q' if cnt_elem_sz == 8 else 'I'}"
+
+        if off_tag >= base_off and off_tag + ntiles * off_elem_sz <= base_off + len(ifd_buf):
+            b_off = ifd_buf[off_tag - base_off:off_tag - base_off + ntiles * off_elem_sz]
+        else:
+            b_off, _ = fetch_range(conn, path, off_tag, off_tag + ntiles * off_elem_sz - 1)
+
+        if cnt_tag >= base_off and cnt_tag + ntiles * cnt_elem_sz <= base_off + len(ifd_buf):
+            b_cnt = ifd_buf[cnt_tag - base_off:cnt_tag - base_off + ntiles * cnt_elem_sz]
+        else:
+            b_cnt, _ = fetch_range(conn, path, cnt_tag, cnt_tag + ntiles * cnt_elem_sz - 1)
+
+        tile_offsets = struct.unpack(off_fmt, b_off)
+        tile_counts = struct.unpack(cnt_fmt, b_cnt)
+        return ntiles, comp_type, predictor, tile_offsets, tile_counts
+    else:
+        raise RuntimeError(f"Unknown TIFF magic: {magic}")
 
 
 def list_year_keys(var, year):
     url = f"https://os.unil.cloud.switch.ch/chelsa02/?prefix=chelsa/global/daily/{var}/{year}/&max-keys=1000"
-    req = urllib.request.Request(url, headers={"User-Agent": "TUBITAK-1002-GitHubActions/1.0"})
-    xml_bytes = urllib.request.urlopen(req, timeout=20).read()
+    req = urllib.request.Request(url, headers={"User-Agent": "TUBITAK-1002-GitHubActions/2.0"})
+    xml_bytes = urllib.request.urlopen(req, timeout=25).read()
     root = ET.fromstring(xml_bytes.decode("utf-8"))
     ns = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
     items = []
@@ -73,66 +209,46 @@ def list_year_keys(var, year):
 def fetch_and_crop_day(item):
     dt_str, key = item
     path = "/chelsa02/" + key
-    for attempt in range(4):
+    for attempt in range(5):
         try:
             conn = get_conn() if attempt == 0 else reset_conn()
-            conn.request("GET", path, headers={"Range": "bytes=0-32767", "Connection": "keep-alive"})
-            r1 = conn.getresponse()
-            buf = r1.read()
-            if r1.status not in (200, 206) or len(buf) < 10000:
-                raise RuntimeError(f"Header status {r1.status}")
-
-            ifd_offset = struct.unpack("<I", buf[4:8])[0]
-            num_entries = struct.unpack("<H", buf[ifd_offset:ifd_offset + 2])[0]
-            off_tag, cnt_tag, ntiles = 3376, 17316, 3485
-            for i in range(num_entries):
-                pos = ifd_offset + 2 + i * 12
-                tag, _, count, val_off = struct.unpack("<HHII", buf[pos:pos + 12])
-                if tag == 324:
-                    off_tag = val_off
-                    ntiles = count
-                elif tag == 325:
-                    cnt_tag = val_off
-
-            tile_offsets = struct.unpack(f"<{ntiles}I", buf[off_tag:off_tag + ntiles * 4])
-            tile_counts = struct.unpack(f"<{ntiles}I", buf[cnt_tag:cnt_tag + ntiles * 4])
+            ntiles, comp_type, predictor, tile_offsets, tile_counts = parse_ifd_and_tiles(conn, path)
 
             if ntiles == 435:
                 s_top, e_top = tile_offsets[103], tile_offsets[103] + tile_counts[103] - 1
                 s_bot, e_bot = tile_offsets[132], tile_offsets[132] + tile_counts[132] - 1
-                conn.request("GET", path, headers={"Range": f"bytes={s_top}-{e_top}", "Connection": "keep-alive"})
-                b_top = conn.getresponse().read()
-                conn.request("GET", path, headers={"Range": f"bytes={s_bot}-{e_bot}", "Connection": "keep-alive"})
-                b_bot = conn.getresponse().read()
+                b_top, _ = fetch_range(conn, path, s_top, e_top)
+                b_bot, _ = fetch_range(conn, path, s_bot, e_bot)
                 canvas_clt = np.empty((1024, 512), dtype=np.uint16)
-                canvas_clt[0:512, :] = np.cumsum(np.frombuffer(zlib.decompress(b_top), dtype="<u2").reshape(512, 512), axis=1, dtype=np.uint16)
-                canvas_clt[512:1024, :] = np.cumsum(np.frombuffer(zlib.decompress(b_bot), dtype="<u2").reshape(512, 512), axis=1, dtype=np.uint16)
-                return (dt_str, canvas_clt[np.ix_(CLT_REL_ROWS, CLT_REL_COLS)].copy(), len(buf) + len(b_top) + len(b_bot))
+                canvas_clt[0:512, :] = decompress_tile(b_top, comp_type, predictor)
+                canvas_clt[512:1024, :] = decompress_tile(b_bot, comp_type, predictor)
+                return (dt_str, canvas_clt[np.ix_(CLT_REL_ROWS, CLT_REL_COLS)].copy(), len(b_top) + len(b_bot))
 
-            s10, e10 = tile_offsets[898], tile_offsets[900] + tile_counts[900] - 1
-            s11, e11 = tile_offsets[983], tile_offsets[985] + tile_counts[985] - 1
+            # Check if row 10 tiles (898, 899, 900) are contiguous and reasonably sized
+            s10 = min(tile_offsets[898], tile_offsets[899], tile_offsets[900])
+            e10 = max(tile_offsets[898] + tile_counts[898], tile_offsets[899] + tile_counts[899], tile_offsets[900] + tile_counts[900]) - 1
+            s11 = min(tile_offsets[983], tile_offsets[984], tile_offsets[985])
+            e11 = max(tile_offsets[983] + tile_counts[983], tile_offsets[984] + tile_counts[984], tile_offsets[985] + tile_counts[985]) - 1
 
-            conn.request("GET", path, headers={"Range": f"bytes={s10}-{e10}", "Connection": "keep-alive"})
-            b10 = conn.getresponse().read()
-            conn.request("GET", path, headers={"Range": f"bytes={s11}-{e11}", "Connection": "keep-alive"})
-            b11 = conn.getresponse().read()
+            b10, _ = fetch_range(conn, path, s10, e10)
+            b11, _ = fetch_range(conn, path, s11, e11)
 
             canvas = np.empty((1024, 1536), dtype=np.uint16)
             for tx_i, t_idx in enumerate([898, 899, 900]):
                 rel_s = tile_offsets[t_idx] - s10
-                raw = zlib.decompress(b10[rel_s:rel_s + tile_counts[t_idx]])
-                canvas[0:512, tx_i * 512:(tx_i + 1) * 512] = np.cumsum(np.frombuffer(raw, dtype="<u2").reshape(512, 512), axis=1, dtype=np.uint16)
+                comp_slice = b10[rel_s:rel_s + tile_counts[t_idx]]
+                canvas[0:512, tx_i * 512:(tx_i + 1) * 512] = decompress_tile(comp_slice, comp_type, predictor)
 
             for tx_i, t_idx in enumerate([983, 984, 985]):
                 rel_s = tile_offsets[t_idx] - s11
-                raw = zlib.decompress(b11[rel_s:rel_s + tile_counts[t_idx]])
-                canvas[512:1024, tx_i * 512:(tx_i + 1) * 512] = np.cumsum(np.frombuffer(raw, dtype="<u2").reshape(512, 512), axis=1, dtype=np.uint16)
+                comp_slice = b11[rel_s:rel_s + tile_counts[t_idx]]
+                canvas[512:1024, tx_i * 512:(tx_i + 1) * 512] = decompress_tile(comp_slice, comp_type, predictor)
 
-            return (dt_str, canvas[REL_R0:REL_R1, REL_C0:REL_C1].copy(), len(buf) + len(b10) + len(b11))
-        except Exception:
-            if attempt == 3:
-                raise
-            time.sleep(0.5 * (attempt + 1))
+            return (dt_str, canvas[REL_R0:REL_R1, REL_C0:REL_C1].copy(), len(b10) + len(b11))
+        except Exception as e:
+            if attempt == 4:
+                raise RuntimeError(f"Failed {key}: {e}")
+            time.sleep(0.8 * (attempt + 1))
 
 
 def main():
@@ -146,16 +262,15 @@ def main():
         st = np.load("calisma_alani_statik_grid_1km.npz")
         outside_mask = (st["province_id"] == 0)
 
-    # Check already uploaded assets in GitHub Release
     existing_assets = set()
     res_check = subprocess.run(["gh", "release", "view", release_tag, "--json", "assets"], capture_output=True, text=True)
     if res_check.returncode == 0:
-        import json
         for a in json.loads(res_check.stdout).get("assets", []):
             existing_assets.add(a["name"])
     else:
         subprocess.run(["gh", "release", "create", release_tag, "--title", "CHELSA-daily v2.1 Ege & Akdeniz 1km Küpleri (1979-2025)", "--notes", "Otomatik bulut indirme çıktıları."], check=False)
 
+    failed_years = []
     for year in range(y_start, y_end + 1):
         if var == "pr" and year >= 2020:
             continue
@@ -166,39 +281,41 @@ def main():
             print(f"[ATLANDI] {out_fname} zaten GitHub Release içinde mevcut.", flush=True)
             continue
 
-        items = list_year_keys(var, year)
-        if not items:
-            continue
+        try:
+            items = list_year_keys(var, year)
+            if not items:
+                continue
 
-        t0 = time.time()
-        with ThreadPoolExecutor(max_workers=32) as ex:
-            results = list(ex.map(fetch_and_crop_day, items))
+            t0 = time.time()
+            with ThreadPoolExecutor(max_workers=24) as ex:
+                results = list(ex.map(fetch_and_crop_day, items))
 
-        dates = np.array([r[0] for r in results], dtype="U10")
-        cube = np.stack([r[1] for r in results], axis=0)
-        if outside_mask is not None:
-            cube[:, outside_mask] = 65535
+            dates = np.array([r[0] for r in results], dtype="U10")
+            cube = np.stack([r[1] for r in results], axis=0)
+            if outside_mask is not None:
+                cube[:, outside_mask] = 65535
 
-        np.savez_compressed(
-            out_fname,
-            dates=dates,
-            data=cube,
-            variable=np.array(var),
-            year=np.array(year, dtype=np.int32),
-            col_bounds=np.array([COL_START, COL_END], dtype=np.int32),
-            row_bounds=np.array([ROW_START, ROW_END], dtype=np.int32),
-        )
-        mb = os.path.getsize(out_fname) / 1e6
-        print(f"[OK] {out_fname} ({mb:.1f} MB) {time.time() - t0:.1f} saniyede oluşturuldu.", flush=True)
+            np.savez_compressed(
+                out_fname,
+                dates=dates,
+                data=cube,
+                variable=np.array(var),
+                year=np.array(year, dtype=np.int32),
+                col_bounds=np.array([COL_START, COL_END], dtype=np.int32),
+                row_bounds=np.array([ROW_START, ROW_END], dtype=np.int32),
+            )
+            mb = os.path.getsize(out_fname) / 1e6
+            print(f"[OK] {out_fname} ({mb:.1f} MB) {time.time() - t0:.1f} saniyede oluşturuldu.", flush=True)
 
-        # 1. Upload to GitHub Release (Zero external secrets needed!)
-        subprocess.run(["gh", "release", "upload", release_tag, out_fname, "--clobber"], check=False)
+            subprocess.run(["gh", "release", "upload", release_tag, out_fname, "--clobber"], check=False)
+            os.remove(out_fname)
+        except Exception as e:
+            print(f"[UYARI] {var} {year} hata aldı, sonraki yıla geçiliyor: {e}", flush=True)
+            failed_years.append(year)
 
-        # 2. Optional: If GDRIVE_RCLONE_TOKEN is configured, also copy directly to Google Drive
-        if os.environ.get("RCLONE_CONFIG_GDRIVE_TOKEN"):
-            subprocess.run(["rclone", "copy", out_fname, f"gdrive:TUBITAK_1002_CHELSA_HCI/02_CHELSA_Gunluk_Veri_1979_2025/{var}/"], check=False)
-
-        os.remove(out_fname)
+    if failed_years:
+        print(f"Tamamlanamayan yıllar ({var}): {failed_years}", flush=True)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -34,8 +34,8 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: NumPy Kur
-        run: pip install numpy
+      - name: NumPy ve Imagecodecs (LZW/BigTIFF) Kur
+        run: pip install numpy imagecodecs
 
       - name: CHELSA COG Karolarını İndir ve Kaydet (${{ matrix.variable }})
         env:
