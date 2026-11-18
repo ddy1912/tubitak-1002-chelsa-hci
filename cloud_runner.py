@@ -226,8 +226,8 @@ def fetch_and_crop_day(item):
 
             if ntiles == 20880:
                 # Stripped TIFF (RowsPerStrip=1, 20880 scanlines of width 43200)
-                s_str = tile_offsets[ROW_START]
-                e_str = tile_offsets[ROW_END - 1] + tile_counts[ROW_END - 1] - 1
+                s_str = min(tile_offsets[ROW_START:ROW_END])
+                e_str = max(tile_offsets[i] + tile_counts[i] for i in range(ROW_START, ROW_END)) - 1
                 b_str, _ = fetch_range(conn, path, s_str, e_str)
                 cropped = np.empty((ROW_END - ROW_START, COL_END - COL_START), dtype=np.uint16)
                 for r_i, s_idx in enumerate(range(ROW_START, ROW_END)):
@@ -263,7 +263,8 @@ def fetch_and_crop_day(item):
             return (dt_str, canvas[REL_R0:REL_R1, REL_C0:REL_C1].copy(), len(b10) + len(b11))
         except Exception as e:
             if attempt == 4:
-                raise RuntimeError(f"Failed {key}: {e}")
+                print(f"[GÜN HATASI - NODATA ATANDI] {key} sunucuda bozuk ({e}), 65535 (NaN) olarak işaretlendi.", flush=True)
+                return (dt_str, np.full((ROW_END - ROW_START, COL_END - COL_START), 65535, dtype=np.uint16), 0)
             time.sleep(0.8 * (attempt + 1))
 
 
